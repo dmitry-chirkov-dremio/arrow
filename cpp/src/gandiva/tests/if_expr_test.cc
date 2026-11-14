@@ -375,4 +375,84 @@ TEST_F(TestIfExpr, TestBigNested) {
   EXPECT_ARROW_ARRAY_EQUALS(exp, outputs.at(0));
 }
 
+namespace {
+
+template <typename ArrowType, typename CType>
+void CheckNegativeConstantResults(arrow::MemoryPool* pool, bool optimize) {
+  auto type = arrow::TypeTraits<ArrowType>::type_singleton();
+  SCOPED_TRACE(type->ToString());
+  auto key_field = field("k", type);
+  auto schema = arrow::schema({key_field});
+  auto key = TreeExprBuilder::MakeField(key_field);
+  auto is_zero = TreeExprBuilder::MakeFunction(
+      "equal", {key, TreeExprBuilder::MakeLiteral(CType{0})}, boolean());
+  auto ten = TreeExprBuilder::MakeLiteral(CType{10});
+  auto minus_five = TreeExprBuilder::MakeLiteral(CType{-5});
+
+  // if (k == 0) 10 else -5, and if (k == 0) -5 else 10
+  auto negative_else = TreeExprBuilder::MakeIf(is_zero, ten, minus_five, type);
+  auto negative_then = TreeExprBuilder::MakeIf(is_zero, minus_five, ten, type);
+
+  std::shared_ptr<Projector> projector;
+  ASSERT_OK(Projector::Make(
+      schema,
+      {TreeExprBuilder::MakeExpression(negative_else, field("negative_else", type)),
+       TreeExprBuilder::MakeExpression(negative_then, field("negative_then", type))},
+      ConfigurationBuilder().build(optimize), &projector));
+
+  auto input = MakeArrowArray<ArrowType, CType>({0, 1, 2});
+  auto batch = arrow::RecordBatch::Make(schema, 3, {input});
+  arrow::ArrayVector outputs;
+  ASSERT_OK(projector->Evaluate(*batch, pool, &outputs));
+  EXPECT_ARROW_ARRAY_EQUALS((MakeArrowArray<ArrowType, CType>({10, -5, -5})),
+                            outputs.at(0));
+  EXPECT_ARROW_ARRAY_EQUALS((MakeArrowArray<ArrowType, CType>({-5, 10, 10})),
+                            outputs.at(1));
+}
+
+}  // namespace
+
+TEST_F(TestIfExpr, TestNegativeConstants) {
+  for (bool optimize : {false, true}) {
+    SCOPED_TRACE(optimize);
+    CheckNegativeConstantResults<arrow::Int32Type, int32_t>(pool_, optimize);
+    CheckNegativeConstantResults<arrow::Int16Type, int16_t>(pool_, optimize);
+    CheckNegativeConstantResults<arrow::Int64Type, int64_t>(pool_, optimize);
+  }
+}
+
+TEST_F(TestIfExpr, TestNestedNegativeFallback) {
+  auto fielda = field("a", int32());
+  auto schema = arrow::schema({fielda});
+  auto node_a = TreeExprBuilder::MakeField(fielda);
+  constexpr int32_t kFallback = -447906508;
+
+  for (int arms : {4, 128}) {
+    // if (a == 0) 10 else if (a == 1) 11 ... else -447906508
+    auto top_node = TreeExprBuilder::MakeLiteral(kFallback);
+    for (int i = arms - 1; i >= 0; --i) {
+      auto condition = TreeExprBuilder::MakeFunction(
+          "equal", {node_a, TreeExprBuilder::MakeLiteral(i)}, boolean());
+      top_node = TreeExprBuilder::MakeIf(condition, TreeExprBuilder::MakeLiteral(i + 10),
+                                         top_node, int32());
+    }
+    auto expr = TreeExprBuilder::MakeExpression(top_node, field("res", int32()));
+
+    auto array0 = MakeArrowArrayInt32({-1, 0, arms - 2, arms - 1, arms, 12345});
+    auto exp =
+        MakeArrowArrayInt32({kFallback, 10, arms + 8, arms + 9, kFallback, kFallback});
+    auto in_batch = arrow::RecordBatch::Make(schema, 6, {array0});
+
+    for (bool optimize : {false, true}) {
+      SCOPED_TRACE(optimize);
+      std::shared_ptr<Projector> projector;
+      ASSERT_OK(Projector::Make(schema, {expr}, ConfigurationBuilder().build(optimize),
+                                &projector));
+      arrow::ArrayVector outputs;
+      ASSERT_OK(projector->Evaluate(*in_batch, pool_, &outputs));
+      EXPECT_ARROW_ARRAY_EQUALS(exp, outputs.at(0));
+    }
+  }
+}
+
 }  // namespace gandiva
